@@ -79,6 +79,9 @@ class ShakespeareDataset(Dataset):
     def split_train_val(self):
         with open(self.file_path, 'r', encoding='utf-8') as f:
             data = f.read()
+        unique_words = len(set(data.split(' ')))
+        print(f'Number of unique words: {unique_words}')
+        print(f'Using BPE suggested number of tokens: {round(unique_words*0.75)}')    
         n = int(0.9*len(data)) #Use first 90% of data for training
         self.train_data = data[:n]
         self.val_data = data[n:]
@@ -115,13 +118,13 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # multiplied by 3 because q, k, v
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         # regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
+        # causal mask to ensure that attention is only applied to the left in the input sequence, upper triangle = 0
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
@@ -129,16 +132,18 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
+        print(f'B, T, C: {x.size()}')
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) #q,k,v calculated togehter and split in different channels again
+        print(f'Query, key, value size before: {q.size(), k.size(), v.size()}')
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
+        print(f'Query, key, value size after: {q.size(), k.size(), v.size()}')
+        exit(0)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # q@k is q matmul k times scaling
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) 
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -174,20 +179,21 @@ class Block(nn.Module):
         return x
 
 class ToMTrainer(nn.Module):
-    """
-    Thanks Andrej
-    """
+    
     @staticmethod
     def get_default_config():
+        """
+            Thanks Andrej
+        """
         C = CN()
         # either model_type or (n_layer, n_head, n_embd) must be given in the config
         C.model_type = 'gpt'
-        C.n_layer = 8
-        C.n_head = 4
-        C.n_embd =  512
+        C.n_layer = None
+        C.n_head = None
+        C.n_embd =  None
         # these options must be filled in externally
-        C.vocab_size = 10000
-        C.block_size = 8
+        C.vocab_size = 31000
+        C.block_size = 32
         # dropout hyperparameters
         C.embd_pdrop = 0.1
         C.resid_pdrop = 0.1
@@ -200,9 +206,7 @@ class ToMTrainer(nn.Module):
         if True:
             # translate from model_type to detailed configuration
             config.merge_from_dict({
-                # names follow the huggingface naming conventions
-                # GPT-1
-                'ToMTrainer':   dict(n_layer=8, n_head=4, n_embd=512),  # 117M params
+                'ToMTrainer':   dict(n_layer=4, n_head=4, n_embd=512),  # 117M params
             }[config.model_type])
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -236,20 +240,15 @@ class ToMTrainer(nn.Module):
             torch.nn.init.ones_(module.weight)
 
     @classmethod
-    def from_pretrained(cls, model_type):
+    def from_pretrained(cls):
         """
-        Initialize a pretrained GPT model by copying over the weights
-        from a huggingface/transformers checkpoint.
+        Initialize ToM model
         """
 
         # create a from-scratch initialized minGPT model
         config = cls.get_default_config()
-        config.model_type = model_type
-        config.vocab_size = 50257 # openai's model vocabulary
-        config.block_size = 1024  # openai's model block_size
+        config.model_type = 'ToMTrainer'
         model = ToMTrainer(config)
-        sd = model.state_dict()
-
         return model
     
     def forward(self, idx, targets=None):
@@ -280,12 +279,13 @@ if __name__ == "__main__":
     # TODO Add validation loss
     print('Hello pretrainers!')
     file_path = "../Data/tinyshakespeare.txt" # Location of data in .txt file format
-    vocab_size = 10000  #Number of unique tokens
+    vocab_size = 31000  #Number of unique tokens
     min_freq = 2 # minimum frequency of tokens for it to be included in the vocabulary
-    block_size = 8
+    block_size = 32
     num_epochs = 1000
-    shaky_data = ShakespeareDataset(file_path=file_path, vocab_size=vocab_size, min_freq=min_freq, block_size=block_size, batch_size=32)
-    ToMTrainerModel = ToMTrainer.from_pretrained(model_type="ToMTrainer")
+    batch_size = 32
+    shaky_data = ShakespeareDataset(file_path=file_path, vocab_size=vocab_size, min_freq=min_freq, block_size=block_size, batch_size=batch_size)
+    ToMTrainerModel = ToMTrainer.from_pretrained()
     optimizer = optim.AdamW(ToMTrainerModel.parameters(), lr=0.001)
     writer = SummaryWriter()
     for epoch in range(num_epochs):
@@ -296,8 +296,8 @@ if __name__ == "__main__":
         optimizer.step()
         writer.add_scalar("Loss/train", loss, epoch) #tensorboard --logdir=runs to run tensorboard found at : http://localhost:6006/ 
         
-        # if epoch % 5 == 0:
-        #     print(f'Epoch: {epoch}, current loss: {loss.item()}')
+        if epoch % 5 == 0:
+            print(f'Epoch: {epoch}, current loss: {loss.item()}')
 
     writer.flush()
 
